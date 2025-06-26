@@ -111,7 +111,7 @@ contract("Marketplace", (accounts) => {
 
     const tx = await marketplace.executeOrders(sellOrder, buyOrder, { from: buyer });
 
-    expectEvent(tx, "ExchangeLogs", {
+    expectEvent(tx, "Exchange", {
       seller: seller,
       buyer: buyer,
       nft: erc721.address,

@@ -5,22 +5,12 @@ import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/interfaces/IERC2981.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
-import "@openzeppelin/contracts/utils/Panic.sol";
-import "@openzeppelin/contracts/utils/math/SafeCast.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
-import "@openzeppelin/contracts/utils/math/SignedMath.sol";
-import "@openzeppelin/contracts/utils/Strings.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
-import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Context.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/interfaces/IERC20.sol";
-import "@openzeppelin/contracts/interfaces/IERC165.sol";
-import "@openzeppelin/contracts/interfaces/IERC1363.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /*
  __  __            _        _     ____  _                
@@ -93,7 +83,7 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         uint256 newPlatformFee
     );
 
-    event ExchangeLogs(
+    event Exchange(
         address seller,
         address buyer,
         address nft,
@@ -104,6 +94,12 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         uint256 platformFee,
         uint256 royaltyFee
     );
+
+    event OrderCancelled(
+        address indexed user, 
+        uint256 indexed orderId
+    );
+
 
     constructor(
         address initRecipient,
@@ -206,7 +202,8 @@ contract MarketPlace is Ownable, ReentrancyGuard {
             );
         } else {
             uint256 sequenceId = order.sequenceId; 
-            if ((ordersById[sequenceId].expiryTimestamp == 0)) {
+            TradeOrder storage storedOrder = ordersById[sequenceId];
+            if ((storedOrder.expiryTimestamp == 0)) {
                 require(
                     _validateOrder(order),
                     "Invalid zero sign message"
@@ -215,12 +212,17 @@ contract MarketPlace is Ownable, ReentrancyGuard {
                 ordersById[sequenceId] = order;
             } else {
                 require(
-                    ordersById[sequenceId].offeredAsset.quantity > 0,
+                    storedOrder.offeredAsset.quantity > 0,
                     "Cancelled order"
                 );
-                ordersById[sequenceId].offeredAsset.quantity = 0;
+                storedOrder.offeredAsset.quantity = 0;
             }
         }
+
+        emit OrderCancelled(
+            order.maker, 
+            order.sequenceId
+        );
     }
 
     function exchange(
@@ -289,7 +291,7 @@ contract MarketPlace is Ownable, ReentrancyGuard {
             payee
         );
 
-        emit ExchangeLogs({
+        emit Exchange({
             seller : sellOrder.maker,
             buyer : buyOrder.maker,
             nft : sellOrder.offeredAsset.tokenAddress,
