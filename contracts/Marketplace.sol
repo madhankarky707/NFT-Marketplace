@@ -6,11 +6,13 @@ import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/interfaces/IERC2981.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Context.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /*
  __  __            _        _     ____  _                
@@ -23,9 +25,8 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 pragma solidity 0.8.28;
 
-contract MarketPlace is Ownable, ReentrancyGuard {
+contract MarketPlace is Ownable, ReentrancyGuard, EIP712, Pausable {
     using MessageHashUtils for bytes32;
-    using SignatureChecker for address;
     using SafeERC20 for IERC20;
 
     enum AssetType {
@@ -34,15 +35,31 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         ERC1155
     }
 
+    bytes32 public constant EXCHANGE_TYPEHASH = keccak256(
+        "Order("
+        "uint256 sequenceId,"
+        "address offeredTokenAddress,"
+        "uint256 offeredTokenId,"
+        "uint256 offeredQuantity,"
+        "uint8 offeredTokenType,"
+        "address desiredTokenAddress,"
+        "uint256 desiredTokenId,"
+        "uint256 desiredAmount,"
+        "address maker,"
+        "bool isSellOrder,"
+        "uint256 salt,"
+        "uint64 expiryTimestamp"
+        ")"
+    );
     uint256 private constant BASIS_POINTS_DIVISOR = 10000;
 
     address public feeRecipient;
     uint256 public platformFee;
     uint256 public batchOrderLimit;
 
-    mapping(uint256 => TradeOrder) public ordersById;
-    mapping(bytes32 => bool) public executedOrderHashes;
-    mapping(address => bool) public allowedTokens;
+    mapping(uint256 sequenceId => TradeOrder) public ordersById;
+    mapping(bytes32 messageHash => bool executed) public executedOrderHashes;
+    mapping(address token => bool allowed) public allowedTokens;
 
     struct ExchangeAsset {
         address tokenAddress;   // Address of token to be received
@@ -83,6 +100,11 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         uint256 newPlatformFee
     );
 
+    event TokenAuthorized(
+        address indexed token,
+        bool indexed authorized
+    );
+
     event Exchange(
         address seller,
         address buyer,
@@ -95,6 +117,11 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         uint256 royaltyFee
     );
 
+    event OrderCreated(
+        address indexed maker, 
+        uint256 indexed sequenceId
+    );
+
     event OrderCancelled(
         address indexed user, 
         uint256 indexed orderId
@@ -105,17 +132,17 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         address initRecipient,
         uint256 initPlatformFee,
         address initOwner
-    ) Ownable(initOwner) {
+    ) Ownable(initOwner) EIP712("MarketPlace", "1.0") {
         _setFeeRecipient(initRecipient);
         _setPlatformFee(initPlatformFee);
     }
 
-    function setFeeRecipient(address newBeneficiary) public onlyOwner {
-        _setFeeRecipient(newBeneficiary);
+    function setFeeRecipient(address newRecipient) public onlyOwner {
+        _setFeeRecipient(newRecipient);
     }
 
-    function setPlatformFee(uint256 newBeneficiaryFee) public onlyOwner {
-        _setPlatformFee(newBeneficiaryFee);
+    function setPlatformFee(uint256 newFee) public onlyOwner {
+        _setPlatformFee(newFee);
     }
 
     function setBatchOrderLimit(uint256 newBatchOrderLimit) public onlyOwner {
@@ -129,15 +156,33 @@ contract MarketPlace is Ownable, ReentrancyGuard {
     }
 
     function authorizeToken(address[] memory token) public onlyOwner {
+        require(token.length <= 20, "Exceed limit");
         for(uint i=0; i< token.length; i++) {
             allowedTokens[token[i]] = true;
+            emit TokenAuthorized({
+                token : token[i],
+                authorized : true
+            });
         }
     }
 
     function unauthorizeToken(address[] memory token) public onlyOwner {
+        require(token.length <= 20, "Exceed limit");
         for(uint i=0; i< token.length; i++) {
             allowedTokens[token[i]] = false;
+            emit TokenAuthorized({
+                token : token[i],
+                authorized : false
+            });
         }
+    }
+
+    function pause() public onlyOwner {
+        _pause();
+    }
+
+    function unpause() public onlyOwner {
+        _unpause();
     }
 
     function batchExecuteOrders	(
@@ -160,7 +205,7 @@ contract MarketPlace is Ownable, ReentrancyGuard {
     function executeOrders(
         TradeOrder memory sellOrder,
         TradeOrder memory buyOrder
-    ) public nonReentrant {
+    ) public whenNotPaused nonReentrant {
         // Validate order types, assets, tokens, and users
         _validateOrdersType(sellOrder, buyOrder);
         // Validate maker (seller) order
@@ -186,7 +231,7 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         }
         
         // Transfer tokens and handle royalty
-        exchange(
+        _exchange(
             sellOrder,
             buyOrder
         );
@@ -225,7 +270,7 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         );
     }
 
-    function exchange(
+    function _exchange(
         TradeOrder memory sellOrder,
         TradeOrder memory buyOrder
     ) private {
@@ -284,7 +329,7 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         _sendERC20(IERC20(paymentToken), payer, payee, sellerProceeds);
         
         // settle NFT Asset
-        transferNFTAsset(
+        _transferNFTAsset(
             sellOrder, 
             buyOrder, 
             payer, 
@@ -304,7 +349,7 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         });
     }
 
-    function transferNFTAsset	(
+    function _transferNFTAsset	(
         TradeOrder memory sellOrder, 
         TradeOrder memory buyOrder, 
         address payer, 
@@ -382,7 +427,7 @@ contract MarketPlace is Ownable, ReentrancyGuard {
         address receiver,
         uint256 tokenId
     ) private {
-        token.transferFrom(sender, receiver, tokenId);
+        token.safeTransferFrom(sender, receiver, tokenId, "0x");
     }
 
     function _sendERC1155(
@@ -401,19 +446,23 @@ contract MarketPlace is Ownable, ReentrancyGuard {
             (price < order.offeredAsset.quantity)
         ) {
             ordersById[order.sequenceId] = order;
+            emit OrderCreated(
+                order.maker, 
+                order.sequenceId
+            );
         }
     }
 
     function _validateOrder(TradeOrder memory order) private returns (bool) {
         bytes32 messageHash = createMessageHash(order);
-        messageHash = messageHash.toEthSignedMessageHash();
+        bytes32 digestHash = _hashTypedDataV4(messageHash);
         require(
-            !executedOrderHashes[messageHash],
+            !executedOrderHashes[digestHash],
             "Signed message already exists"
         );
-        bool isValidSign = order.maker.isValidSignatureNow(messageHash, order.signature);
+        bool isValidSign = ECDSA.recover(digestHash, order.signature) == order.maker;
         if (isValidSign)
-            executedOrderHashes[messageHash] = true;
+            executedOrderHashes[digestHash] = true;
 
         return isValidSign;
     }
@@ -433,7 +482,11 @@ contract MarketPlace is Ownable, ReentrancyGuard {
             "Buyer asset type is invalid"
         );  
         // Validate token whitelisting and matching
-        require(allowedTokens[buyOrder.offeredAsset.tokenAddress], "Unauthorized token");
+        require(
+            allowedTokens[buyOrder.offeredAsset.tokenAddress] &&
+            allowedTokens[sellOrder.offeredAsset.tokenAddress],
+            "Unauthorized token"
+        );
         require(
             sellOrder.offeredAsset.tokenAddress == buyOrder.desiredAsset.tokenAddress &&
             buyOrder.offeredAsset.tokenAddress == sellOrder.desiredAsset.tokenAddress,
@@ -454,7 +507,8 @@ contract MarketPlace is Ownable, ReentrancyGuard {
     {
         return
             keccak256(
-                abi.encodePacked(
+                abi.encode(
+                    EXCHANGE_TYPEHASH,
                     order.sequenceId,
                     order.offeredAsset.tokenAddress,
                     order.offeredAsset.tokenId,
@@ -465,6 +519,7 @@ contract MarketPlace is Ownable, ReentrancyGuard {
                     order.desiredAsset.amount,
                     order.maker,
                     order.isSellOrder,
+                    order.salt,
                     order.expiryTimestamp
                 )
             );
