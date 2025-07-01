@@ -320,7 +320,7 @@ contract MarketPlace is Ownable, ReentrancyGuard, EIP712, Pausable {
             _sendERC20(
                 IERC20(paymentToken),
                 payer,
-                feeRecipient != address(0) ? feeRecipient : owner(),
+                feeRecipient,
                 platformFeeAmount
             );
         }
